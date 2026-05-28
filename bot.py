@@ -81,7 +81,7 @@ def _parse(raw: str) -> dict:
 def extract_from_image(image_bytes: bytes, mime: str = "image/jpeg") -> dict:
     b64 = base64.standard_b64encode(image_bytes).decode()
     msg = client.messages.create(
-        model="claude-opus-4-5", max_tokens=500, system=SYSTEM_PROMPT,
+        model="claude-haiku-4-5-20251001", max_tokens=500, system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}},
             {"type": "text", "text": "Извлеки данные из этого скриншота резюме."}
@@ -92,7 +92,7 @@ def extract_from_image(image_bytes: bytes, mime: str = "image/jpeg") -> dict:
 def extract_from_pdf(pdf_bytes: bytes) -> dict:
     b64 = base64.standard_b64encode(pdf_bytes).decode()
     msg = client.messages.create(
-        model="claude-opus-4-5", max_tokens=500, system=SYSTEM_PROMPT,
+        model="claude-haiku-4-5-20251001", max_tokens=500, system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": [
             {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": b64}},
             {"type": "text", "text": "Извлеки данные из этого резюме."}
@@ -102,7 +102,7 @@ def extract_from_pdf(pdf_bytes: bytes) -> dict:
 
 def extract_from_text(text: str) -> dict:
     msg = client.messages.create(
-        model="claude-opus-4-5", max_tokens=500, system=SYSTEM_PROMPT,
+        model="claude-haiku-4-5-20251001", max_tokens=500, system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": f"Резюме:\n{text}"}],
     )
     return _parse(msg.content[0].text)
@@ -291,4 +291,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
