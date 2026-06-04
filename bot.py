@@ -7,12 +7,13 @@ import logging
 from pathlib import Path
 from datetime import datetime
 from io import BytesIO
+
 import anthropic
 from docx import Document
 import gspread
 from google.oauth2.service_account import Credentials
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl import load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 
@@ -112,48 +113,48 @@ def get_rows_since(since: datetime | None) -> list[list]:
 
 # ── xlsx генерация ─────────────────────────────────────────────────────────────
 
+TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "crm_template.xlsx")
+
 def generate_crm_xlsx(rows: list[list]) -> BytesIO:
-    """Генерирует xlsx в формате CRM из строк таблицы."""
-    wb = Workbook()
+    """Генерирует xlsx точной копией шаблона CRM."""
+    wb = load_workbook(TEMPLATE_PATH)
     ws = wb.active
-    ws.title = "Импорт"
 
-    # Заголовок
-    header_fill = PatternFill("solid", start_color="4472C4")
-    header_font = Font(bold=True, color="FFFFFF", name="Arial", size=10)
-    for col, h in enumerate(CRM_HEADERS, 1):
-        cell = ws.cell(row=1, column=col, value=h)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center")
+    # Очищаем старые данные (оставляем только заголовок)
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+        for cell in row:
+            cell.value = None
 
-    # Данные
+    # Стили — точно как в шаблоне
+    thin = Side(style="thin")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    arial_bold = Font(name="Arial", bold=True)
+    jetbrains  = Font(name="JetBrains Mono", bold=False)
+    white_fill = PatternFill("solid", fgColor="FFFFFFFF")
+
     # rows колонки: ФИО(0) Телефон(1) Возраст(2) Город(3) Должности(4) Источник(5) Кто(6) Дата(7)
-    data_font = Font(name="Arial", size=10)
     for r_i, row in enumerate(rows, 2):
         fio      = row[0] if len(row) > 0 else ""
-        phone    = row[1] if len(row) > 1 else ""
+        phone    = str(row[1]).replace(".0", "") if len(row) > 1 else ""
         city     = row[3] if len(row) > 3 else ""
-        age      = row[2] if len(row) > 2 else ""
+        age      = str(row[2]).replace(".0", "") if len(row) > 2 else ""
         position = row[4] if len(row) > 4 else ""
         source   = row[5] if len(row) > 5 else ""
 
-        # Телефон как текст чтобы не было 3.8E+11
-        phone_cell = ws.cell(row=r_i, column=2, value=f"'{phone}")
-
         vals = [fio, phone, city, age, position, source]
+        ws.row_dimensions[r_i].height = 15.75
+
         for c_i, val in enumerate(vals, 1):
             cell = ws.cell(row=r_i, column=c_i, value=val)
-            cell.font = data_font
-            if c_i == 2:  # телефон — текстовый формат
+            cell.border = border
+            cell.fill = white_fill
+            cell.alignment = Alignment(horizontal="left", vertical="bottom")
+            if c_i == 6:  # ИСТОЧНИК — JetBrains Mono
+                cell.font = jetbrains
+            else:
+                cell.font = arial_bold
+            if c_i == 2:  # НОМЕР — текст, без .0 и E+11
                 cell.number_format = "@"
-
-    ws.column_dimensions["A"].width = 25
-    ws.column_dimensions["B"].width = 18
-    ws.column_dimensions["C"].width = 15
-    ws.column_dimensions["D"].width = 8
-    ws.column_dimensions["E"].width = 35
-    ws.column_dimensions["F"].width = 15
 
     buf = BytesIO()
     wb.save(buf)
