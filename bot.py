@@ -7,12 +7,13 @@ import logging
 from pathlib import Path
 from datetime import datetime
 from io import BytesIO
-
 import anthropic
 from docx import Document
 import gspread
 from google.oauth2.service_account import Credentials
-from telegram import Update
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -23,7 +24,9 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 GOOGLE_SHEET_ID   = os.environ["GOOGLE_SHEET_ID"]
 GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDS_JSON"]
 
-HEADERS = ["ФИО", "Телефон", "Возраст", "Город", "Должности", "Источник", "Кто добавил", "Дата"]
+HEADERS       = ["ФИО", "Телефон", "Возраст", "Город", "Должности", "Источник", "Кто добавил", "Дата"]
+CRM_HEADERS   = ["ФИО", "НОМЕР", "ГОРОД", "ВОЗРАСТ", "ПОЗИЦИЯ", "ИСТОЧНИК"]
+DATE_FMT      = "%d.%m.%Y %H:%M"
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -33,23 +36,129 @@ BATCH_WAIT = 4
 
 # ── Google Sheets ──────────────────────────────────────────────────────────────
 
-def get_sheet():
+def get_gc():
     creds_data = json.loads(GOOGLE_CREDS_JSON)
     scopes = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(creds_data, scopes=scopes)
-    gc = gspread.authorize(creds)
+    return gspread.authorize(creds)
+
+def get_sheet(name="Резюме"):
+    gc = get_gc()
     sh = gc.open_by_key(GOOGLE_SHEET_ID)
     try:
-        ws = sh.worksheet("Резюме")
+        ws = sh.worksheet(name)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet("Резюме", rows=5000, cols=len(HEADERS))
-        ws.append_row(HEADERS)
-        ws.format("A1:H1", {"textFormat": {"bold": True}})
+        ws = sh.add_worksheet(name, rows=5000, cols=20)
+        if name == "Резюме":
+            ws.append_row(HEADERS)
+            ws.format("A1:H1", {"textFormat": {"bold": True}})
+        elif name == "Экспорты":
+            ws.append_row(["chat_id", "last_export"])
     return ws
 
 def append_rows_batch(rows: list[list]):
-    ws = get_sheet()
+    ws = get_sheet("Резюме")
     ws.append_rows(rows, value_input_option="USER_ENTERED")
+
+def get_last_export(chat_id: int) -> datetime | None:
+    """Возвращает время последнего экспорта для данного chat_id."""
+    try:
+        ws = get_sheet("Экспорты")
+        records = ws.get_all_records()
+        for r in records:
+            if str(r.get("chat_id")) == str(chat_id):
+                raw = r.get("last_export", "")
+                if raw:
+                    return datetime.strptime(raw, DATE_FMT)
+    except Exception as e:
+        log.warning(f"get_last_export error: {e}")
+    return None
+
+def set_last_export(chat_id: int, dt: datetime):
+    """Сохраняет время экспорта."""
+    try:
+        ws = get_sheet("Экспорты")
+        records = ws.get_all_values()
+        # Ищем строку с этим chat_id
+        for i, row in enumerate(records[1:], start=2):
+            if row and str(row[0]) == str(chat_id):
+                ws.update(f"B{i}", [[dt.strftime(DATE_FMT)]])
+                return
+        # Не нашли — добавляем новую строку
+        ws.append_row([str(chat_id), dt.strftime(DATE_FMT)])
+    except Exception as e:
+        log.warning(f"set_last_export error: {e}")
+
+def get_rows_since(since: datetime | None) -> list[list]:
+    """Возвращает строки из листа Резюме начиная с даты since."""
+    ws = get_sheet("Резюме")
+    all_rows = ws.get_all_values()
+    if len(all_rows) <= 1:
+        return []
+    result = []
+    for row in all_rows[1:]:  # пропускаем заголовок
+        if len(row) < 8:
+            continue
+        date_str = row[7].strip()
+        if not date_str:
+            continue
+        try:
+            row_dt = datetime.strptime(date_str, DATE_FMT)
+        except Exception:
+            continue
+        if since is None or row_dt > since:
+            result.append(row)
+    return result
+
+# ── xlsx генерация ─────────────────────────────────────────────────────────────
+
+def generate_crm_xlsx(rows: list[list]) -> BytesIO:
+    """Генерирует xlsx в формате CRM из строк таблицы."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Импорт"
+
+    # Заголовок
+    header_fill = PatternFill("solid", start_color="4472C4")
+    header_font = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+    for col, h in enumerate(CRM_HEADERS, 1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center")
+
+    # Данные
+    # rows колонки: ФИО(0) Телефон(1) Возраст(2) Город(3) Должности(4) Источник(5) Кто(6) Дата(7)
+    data_font = Font(name="Arial", size=10)
+    for r_i, row in enumerate(rows, 2):
+        fio      = row[0] if len(row) > 0 else ""
+        phone    = row[1] if len(row) > 1 else ""
+        city     = row[3] if len(row) > 3 else ""
+        age      = row[2] if len(row) > 2 else ""
+        position = row[4] if len(row) > 4 else ""
+        source   = row[5] if len(row) > 5 else ""
+
+        # Телефон как текст чтобы не было 3.8E+11
+        phone_cell = ws.cell(row=r_i, column=2, value=f"'{phone}")
+
+        vals = [fio, phone, city, age, position, source]
+        for c_i, val in enumerate(vals, 1):
+            cell = ws.cell(row=r_i, column=c_i, value=val)
+            cell.font = data_font
+            if c_i == 2:  # телефон — текстовый формат
+                cell.number_format = "@"
+
+    ws.column_dimensions["A"].width = 25
+    ws.column_dimensions["B"].width = 18
+    ws.column_dimensions["C"].width = 15
+    ws.column_dimensions["D"].width = 8
+    ws.column_dimensions["E"].width = 35
+    ws.column_dimensions["F"].width = 15
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
 
 # ── Claude extraction ──────────────────────────────────────────────────────────
 
@@ -159,7 +268,7 @@ async def run_batch(chat_id: int, status_msg, bot):
 
     ok, errors = [], []
     rows = []
-    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+    now = datetime.now().strftime(DATE_FMT)
 
     for data in results:
         if data:
@@ -198,8 +307,44 @@ async def run_batch(chat_id: int, status_msg, bot):
             )
         if len(ok) > 5:
             report += f"\n\n  ...и ещё {len(ok)-5}"
+    report += "\n\n📤 Когда готов выгрузить в CRM — нажми /export"
 
     await status_msg.edit_text(report)
+
+# ── Export handler ─────────────────────────────────────────────────────────────
+
+async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    msg = await update.message.reply_text("⏳ Формирую файл для CRM...")
+
+    try:
+        last = get_last_export(chat_id)
+        rows = get_rows_since(last)
+
+        if not rows:
+            period = f"с {last.strftime(DATE_FMT)}" if last else "за всё время"
+            await msg.edit_text(f"📭 Нет новых резюме {period}.")
+            return
+
+        buf = generate_crm_xlsx(rows)
+        now = datetime.now()
+        fname = f"crm_import_{now.strftime('%d%m%Y_%H%M')}.xlsx"
+
+        period_str = f"с {last.strftime(DATE_FMT)}" if last else "за всё время"
+        caption = f"📊 Экспорт для CRM\n{period_str} → {now.strftime(DATE_FMT)}\nКонтактов: {len(rows)}"
+
+        await ctx.bot.send_document(
+            chat_id=chat_id,
+            document=buf,
+            filename=fname,
+            caption=caption,
+        )
+        set_last_export(chat_id, now)
+        await msg.delete()
+
+    except Exception as e:
+        log.exception(f"Export error: {e}")
+        await msg.edit_text(f"❌ Ошибка при экспорте: {e}")
 
 # ── Telegram handlers ──────────────────────────────────────────────────────────
 
@@ -214,7 +359,7 @@ async def schedule_batch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     count = len(pending.get(chat_id, []))
     if count == 1:
-        msg = await update.message.reply_text(f"📥 Получено 1 резюме, жду ещё...")
+        msg = await update.message.reply_text("📥 Получено 1 резюме, жду ещё...")
         ctx.chat_data["status_msg"] = msg
     else:
         try:
@@ -271,11 +416,17 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name or ""
+    keyboard = ReplyKeyboardMarkup(
+        [[KeyboardButton("📤 Экспорт в CRM (/export)")]],
+        resize_keyboard=True
+    )
     await update.message.reply_text(
         f"👋 Привет, {name}!\n\n"
-        "Отправь мне резюме — извлеку данные и запишу в Google Таблицу.\n\n"
+        "Отправь резюме — извлеку данные и запишу в Google Таблицу.\n\n"
         "📎 Форматы: фото, jpg, png, pdf, docx\n"
-        "📦 Можно кидать пачками — обработаю всё сразу!"
+        "📦 Можно кидать пачками\n\n"
+        "📤 /export — выгрузить xlsx для CRM",
+        reply_markup=keyboard,
     )
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -283,6 +434,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("export", cmd_export))
+    app.add_handler(MessageHandler(filters.Regex(r"Экспорт в CRM"), cmd_export))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
