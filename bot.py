@@ -90,18 +90,19 @@ def set_last_export(chat_id: int, dt: datetime):
     except Exception as e:
         log.warning(f"set_last_export error: {e}")
 
-def get_rows_since(since: datetime | None) -> list[list]:
-    """Возвращает строки из листа Резюме начиная с даты since."""
+def get_rows_since(since: datetime | None, user_name: str) -> list[list]:
+    """Возвращает строки для конкретного пользователя начиная с даты since."""
     ws = get_sheet("Резюме")
     all_rows = ws.get_all_values()
     if len(all_rows) <= 1:
         return []
     result = []
-    for row in all_rows[1:]:  # пропускаем заголовок
+    for row in all_rows[1:]:
         if len(row) < 8:
             continue
         date_str = row[7].strip()
-        if not date_str:
+        who      = row[6].strip()
+        if not date_str or who != user_name:
             continue
         try:
             row_dt = datetime.strptime(date_str, DATE_FMT)
@@ -318,8 +319,9 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("⏳ Формирую файл для CRM...")
 
     try:
+        user_name = update.effective_user.full_name or update.effective_user.username or str(update.effective_user.id)
         last = get_last_export(chat_id)
-        rows = get_rows_since(last)
+        rows = get_rows_since(last, user_name)
 
         if not rows:
             period = f"с {last.strftime(DATE_FMT)}" if last else "за всё время"
