@@ -120,10 +120,9 @@ def generate_crm_xlsx(rows: list[list]) -> BytesIO:
     wb = load_workbook(TEMPLATE_PATH)
     ws = wb.active
 
-    # Очищаем старые данные (оставляем только заголовок)
-    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-        for cell in row:
-            cell.value = None
+    # Удаляем все строки с данными (оставляем только заголовок)
+    if ws.max_row > 1:
+        ws.delete_rows(2, ws.max_row - 1)
 
     # Стили — точно как в шаблоне
     thin = Side(style="thin")
@@ -172,7 +171,7 @@ SYSTEM_PROMPT = """Ты извлекаешь данные из резюме с �
   "age": "только цифра, например 23",
   "city": "город на русском языке (Днепр, Киев, Харьков и т.д.)",
   "positions": "должность1, должность2 (на языке оригинала)",
-  "source": "work.ua или rabota.ua или olx.ua — определи по логотипу, цветам, стилю сайта. Если не можешь — unknown"
+  "source": "Work.ua или Rabota.ua или OLX — определи по логотипу, цветам, стилю сайта. Если не можешь — unknown"
 }
 
 Правила для телефона:
