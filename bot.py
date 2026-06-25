@@ -355,9 +355,9 @@ async def process_item(item: dict, bot) -> dict | None:
 # ── Batch processor ────────────────────────────────────────────────────────────
 
 async def safe_edit(msg, text: str):
-    """Редактирует сообщение — игнорирует если уже нельзя редактировать."""
+    """Редактирует сообщение — если нельзя, отправляет новое."""
     try:
-        await safe_edit(msg, text)
+        await msg.edit_text(text)
     except Exception:
         try:
             await msg.reply_text(text)
@@ -573,3 +573,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
