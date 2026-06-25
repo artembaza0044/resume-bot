@@ -22,8 +22,9 @@ log = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-GOOGLE_SHEET_ID   = os.environ["GOOGLE_SHEET_ID"]
-GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDS_JSON"]
+GOOGLE_SHEET_ID      = os.environ["GOOGLE_SHEET_ID"]
+GOOGLE_CREDS_JSON    = os.environ["GOOGLE_CREDS_JSON"]
+GOOGLE_DRIVE_FOLDER  = os.environ.get("GOOGLE_DRIVE_FOLDER", "")
 
 HEADERS       = ["ФИО", "Телефон", "Возраст", "Город", "Должности", "Источник", "Кто добавил", "Дата"]
 CRM_HEADERS   = ["ФИО", "НОМЕР", "ГОРОД", "ВОЗРАСТ", "ПОЗИЦИЯ", "ИСТОЧНИК"]
@@ -40,6 +41,44 @@ def get_gc():
     scopes = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(creds_data, scopes=scopes)
     return gspread.authorize(creds)
+
+def upload_to_drive(file_bytes: bytes, filename: str, city: str, mime_type: str):
+    """Загружает файл на Google Drive в папку Город/YYYY-MM-DD."""
+    if not GOOGLE_DRIVE_FOLDER:
+        return
+    try:
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaIoBaseUpload
+        creds_data = json.loads(GOOGLE_CREDS_JSON)
+        scopes = ["https://www.googleapis.com/auth/drive"]
+        from google.oauth2.service_account import Credentials
+        creds = Credentials.from_service_account_info(creds_data, scopes=scopes)
+        service = build("drive", "v3", credentials=creds)
+
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        city_name = city if city else "Без города"
+
+        def get_or_create_folder(name, parent_id):
+            q = f"name='{name}' and '{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            res = service.files().list(q=q, fields="files(id)").execute()
+            if res["files"]:
+                return res["files"][0]["id"]
+            meta = {"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}
+            f = service.files().create(body=meta, fields="id").execute()
+            return f["id"]
+
+        city_folder_id = get_or_create_folder(city_name, GOOGLE_DRIVE_FOLDER)
+        date_folder_id = get_or_create_folder(date_str, city_folder_id)
+
+        media = MediaIoBaseUpload(BytesIO(file_bytes), mimetype=mime_type)
+        service.files().create(
+            body={"name": filename, "parents": [date_folder_id]},
+            media_body=media,
+            fields="id"
+        ).execute()
+        log.info(f"Uploaded {filename} to Drive: {city_name}/{date_str}")
+    except Exception as e:
+        log.warning(f"Drive upload error: {e}")
 
 def get_sheet(name="Резюме"):
     gc = get_gc()
@@ -338,15 +377,25 @@ async def process_item(item: dict, bot) -> dict | None:
             file = await bot.get_file(item["file_id"])
             raw = bytes(await file.download_as_bytearray())
             data = extract_from_pdf(raw)
+            data["_raw"] = raw
+            data["_fname"] = item.get("fname", "resume.pdf")
+            data["_mime"] = "application/pdf"
         elif kind == "docx":
             file = await bot.get_file(item["file_id"])
             raw = bytes(await file.download_as_bytearray())
             data = extract_from_docx(raw)
+            data["_raw"] = raw
+            data["_fname"] = item.get("fname", "resume.docx")
+            data["_mime"] = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         elif kind == "text":
             data = extract_from_text(item["text"])
         else:
             return None
         data["who"] = item.get("who", "")
+        # Загружаем файл на Drive (только pdf и docx, после того как знаем город)
+        if "_raw" in data:
+            city = data.get("city", "")
+            upload_to_drive(data.pop("_raw"), data.pop("_fname"), city, data.pop("_mime"))
         return data
     except Exception as e:
         log.exception(f"Error processing item: {e}")
@@ -573,4 +622,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
