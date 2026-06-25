@@ -25,6 +25,7 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 GOOGLE_SHEET_ID      = os.environ["GOOGLE_SHEET_ID"]
 GOOGLE_CREDS_JSON    = os.environ["GOOGLE_CREDS_JSON"]
 GOOGLE_DRIVE_FOLDER  = os.environ.get("GOOGLE_DRIVE_FOLDER", "")
+TELEGRAM_GROUP_ID    = os.environ.get("TELEGRAM_GROUP_ID", "")
 
 HEADERS       = ["ФИО", "Телефон", "Возраст", "Город", "Должности", "Источник", "Кто добавил", "Дата"]
 CRM_HEADERS   = ["ФИО", "НОМЕР", "ГОРОД", "ВОЗРАСТ", "ПОЗИЦИЯ", "ИСТОЧНИК"]
@@ -60,11 +61,17 @@ def upload_to_drive(file_bytes: bytes, filename: str, city: str, mime_type: str)
 
         def get_or_create_folder(name, parent_id):
             q = f"name='{name}' and '{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-            res = service.files().list(q=q, fields="files(id)").execute()
+            res = service.files().list(
+                q=q, fields="files(id)",
+                supportsAllDrives=True, includeItemsFromAllDrives=True
+            ).execute()
             if res["files"]:
                 return res["files"][0]["id"]
             meta = {"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}
-            f = service.files().create(body=meta, fields="id").execute()
+            f = service.files().create(
+                body=meta, fields="id",
+                supportsAllDrives=True
+            ).execute()
             return f["id"]
 
         city_folder_id = get_or_create_folder(city_name, GOOGLE_DRIVE_FOLDER)
@@ -74,11 +81,63 @@ def upload_to_drive(file_bytes: bytes, filename: str, city: str, mime_type: str)
         service.files().create(
             body={"name": filename, "parents": [date_folder_id]},
             media_body=media,
-            fields="id"
+            fields="id",
+            supportsAllDrives=True
         ).execute()
         log.info(f"Uploaded {filename} to Drive: {city_name}/{date_str}")
     except Exception as e:
         log.warning(f"Drive upload error: {e}")
+
+# Кэш тем: город -> topic_id
+_topic_cache: dict[str, int] = {}
+
+async def get_or_create_topic(bot, city: str) -> int | None:
+    """Возвращает ID темы для города, создаёт если нет."""
+    if not TELEGRAM_GROUP_ID:
+        return None
+    group_id = int(TELEGRAM_GROUP_ID)
+    city_name = city if city else "Без города"
+
+    if city_name in _topic_cache:
+        return _topic_cache[city_name]
+
+    try:
+        # Создаём новую тему
+        topic = await bot.create_forum_topic(
+            chat_id=group_id,
+            name=city_name,
+        )
+        _topic_cache[city_name] = topic.message_thread_id
+        log.info(f"Created topic '{city_name}': {topic.message_thread_id}")
+        return topic.message_thread_id
+    except Exception as e:
+        # Тема возможно уже существует — ищем в кэше или возвращаем None
+        log.warning(f"Topic create error for '{city_name}': {e}")
+        return _topic_cache.get(city_name)
+
+async def send_file_to_group(bot, file_bytes: bytes, filename: str, city: str, 
+                              fio: str, phone: str, mime_type: str):
+    """Отправляет файл в нужную тему группы."""
+    if not TELEGRAM_GROUP_ID:
+        return
+    try:
+        group_id = int(TELEGRAM_GROUP_ID)
+        topic_id = await get_or_create_topic(bot, city)
+        caption = f"👤 {fio}\n📞 {phone}\n🏙 {city if city else '—'}"
+        buf = BytesIO(file_bytes)
+        buf.name = filename
+        kwargs = dict(
+            chat_id=group_id,
+            document=buf,
+            filename=filename,
+            caption=caption,
+        )
+        if topic_id:
+            kwargs["message_thread_id"] = topic_id
+        await bot.send_document(**kwargs)
+        log.info(f"Sent {filename} to group topic '{city}'")
+    except Exception as e:
+        log.warning(f"Group send error: {e}")
 
 def get_sheet(name="Резюме"):
     gc = get_gc()
@@ -392,10 +451,15 @@ async def process_item(item: dict, bot) -> dict | None:
         else:
             return None
         data["who"] = item.get("who", "")
-        # Загружаем файл на Drive (только pdf и docx, после того как знаем город)
+        # Отправляем файл в Telegram группу по теме-городу
         if "_raw" in data:
-            city = data.get("city", "")
-            upload_to_drive(data.pop("_raw"), data.pop("_fname"), city, data.pop("_mime"))
+            city  = data.get("city", "")
+            fio   = data.get("fio", "")
+            phone = data.get("phone", "")
+            raw   = data.pop("_raw")
+            fname = data.pop("_fname")
+            mime  = data.pop("_mime")
+            await send_file_to_group(bot, raw, fname, city, fio, phone, mime)
         return data
     except Exception as e:
         log.exception(f"Error processing item: {e}")
