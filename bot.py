@@ -354,13 +354,23 @@ async def process_item(item: dict, bot) -> dict | None:
 
 # ── Batch processor ────────────────────────────────────────────────────────────
 
+async def safe_edit(msg, text: str):
+    """Редактирует сообщение — игнорирует если уже нельзя редактировать."""
+    try:
+        await safe_edit(msg, text)
+    except Exception:
+        try:
+            await msg.reply_text(text)
+        except Exception:
+            pass
+
 async def run_batch(chat_id: int, status_msg, bot):
     items = pending.pop(chat_id, [])
     if not items:
         return
 
     total = len(items)
-    await status_msg.edit_text(f"⏳ Обрабатываю {total} резюме параллельно...")
+    await safe_edit(status_msg, f"⏳ Обрабатываю {total} резюме параллельно...")
 
     tasks = [process_item(item, bot) for item in items]
     results = await asyncio.gather(*tasks)
@@ -390,7 +400,7 @@ async def run_batch(chat_id: int, status_msg, bot):
             append_rows_batch(rows)
         except Exception as e:
             log.exception(f"Sheet write error: {e}")
-            await status_msg.edit_text(f"❌ Ошибка записи в таблицу: {e}")
+            await safe_edit(status_msg, f"❌ Ошибка записи в таблицу: {e}")
             return
 
     report = f"✅ Готово! Обработано {len(ok)}/{total}"
@@ -408,7 +418,7 @@ async def run_batch(chat_id: int, status_msg, bot):
             report += f"\n\n  ...и ещё {len(ok)-5}"
     report += "\n\n📤 Когда готов выгрузить в CRM — нажми /export"
 
-    await status_msg.edit_text(report)
+    await safe_edit(status_msg, report)
 
 # ── Export handler ─────────────────────────────────────────────────────────────
 
@@ -423,7 +433,7 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         if not rows:
             period = f"с {last.strftime(DATE_FMT)}" if last else "за всё время"
-            await msg.edit_text(f"📭 Нет новых резюме {period}.")
+            await safe_edit(msg, f"📭 Нет новых резюме {period}.")
             return
 
         buf = generate_crm_xlsx(rows)
@@ -444,7 +454,7 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         log.exception(f"Export error: {e}")
-        await msg.edit_text(f"❌ Ошибка при экспорте: {e}")
+        await safe_edit(msg, f"❌ Ошибка при экспорте: {e}")
 
 # ── Telegram handlers ──────────────────────────────────────────────────────────
 
@@ -563,4 +573,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
