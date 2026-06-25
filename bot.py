@@ -57,9 +57,65 @@ def get_sheet(name="Резюме"):
             ws.append_row(["chat_id", "last_export"])
     return ws
 
+CITY_ALIASES = {
+    "дніпро": "Днепр", "дніпропетровськ": "Днепр", "днепропетровск": "Днепр",
+    "днепр": "Днепр", "d": "Днепр",
+    "київ": "Киев", "киев": "Киев",
+    "харків": "Харьков", "харьков": "Харьков",
+    "кривий ріг": "Кривой Рог", "кривой рог": "Кривой Рог",
+    "запоріжжя": "Запорожье", "запорожье": "Запорожье",
+    "львів": "Львов", "львов": "Львов",
+    "одеса": "Одесса", "одесса": "Одесса",
+    "миколаїв": "Николаев", "николаев": "Николаев",
+    "полтава": "Полтава",
+    "вінниця": "Винница", "винница": "Винница",
+    "павлоград": "Павлоград",
+    "кам'янське": "Каменское", "каменское": "Каменское",
+    "нікополь": "Никополь", "никополь": "Никополь",
+}
+
+def normalize_city(city: str) -> str:
+    if not city:
+        return ""
+    key = city.strip().lower()
+    return CITY_ALIASES.get(key, city.strip().title())
+
+def get_or_create_city_sheet(sh, city: str):
+    """Получает или создаёт лист для города."""
+    sheet_name = city if city else "Без города"
+    try:
+        ws = sh.worksheet(sheet_name)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(sheet_name, rows=5000, cols=len(HEADERS))
+        ws.append_row(HEADERS)
+        ws.format(f"A1:H1", {"textFormat": {"bold": True},
+                              "backgroundColor": {"red": 0.27, "green": 0.51, "blue": 0.71}})
+    return ws
+
 def append_rows_batch(rows: list[list]):
-    ws = get_sheet("Резюме")
-    ws.append_rows(rows, value_input_option="USER_ENTERED")
+    gc = get_gc()
+    sh = gc.open_by_key(GOOGLE_SHEET_ID)
+
+    # 1. Главный лист "Резюме" — все записи
+    try:
+        ws_main = sh.worksheet("Резюме")
+    except gspread.WorksheetNotFound:
+        ws_main = sh.add_worksheet("Резюме", rows=5000, cols=len(HEADERS))
+        ws_main.append_row(HEADERS)
+        ws_main.format("A1:H1", {"textFormat": {"bold": True}})
+    ws_main.append_rows(rows, value_input_option="USER_ENTERED")
+
+    # 2. Листы по городам
+    city_groups: dict[str, list] = {}
+    for row in rows:
+        raw_city = row[3] if len(row) > 3 else ""
+        city = normalize_city(raw_city)
+        row[3] = city  # обновляем нормализованный город
+        city_groups.setdefault(city, []).append(row)
+
+    for city, city_rows in city_groups.items():
+        ws_city = get_or_create_city_sheet(sh, city)
+        ws_city.append_rows(city_rows, value_input_option="USER_ENTERED")
 
 def get_last_export(chat_id: int) -> datetime | None:
     """Возвращает время последнего экспорта для данного chat_id."""
@@ -170,7 +226,7 @@ SYSTEM_PROMPT = """Ты извлекаешь данные из резюме с �
   "fio": "Фамилия Имя Отчество на языке оригинала",
   "phone": "380XXXXXXXXX (только цифры, начиная с 380, без пробелов тире скобок плюсов)",
   "age": "только цифра, например 23",
-  "city": "город на русском языке (Днепр, Киев, Харьков и т.д.)",
+  "city": "город на русском языке — ТОЛЬКО название города без района и области (Днепр, Киев, Харьков, Кривой Рог, Павлоград и т.д.)",
   "positions": "должность1, должность2 (на языке оригинала)",
   "source": "Work.ua или Rabota.ua или OLX — определи по логотипу, цветам, стилю сайта. Если не можешь — unknown"
 }
@@ -180,6 +236,12 @@ SYSTEM_PROMPT = """Ты извлекаешь данные из резюме с �
 - +38 0XX... → 380XXXXXXXXX
 - Уже начинается с 380 — оставь как есть
 - Только цифры, никаких символов
+
+Правила для города:
+- Ищи в любом месте страницы: блок "Місцезнаходження", "Місто", "Город", рядом с картой, в контактах
+- На OLX город часто в блоке "Місцезнаходження" или под именем
+- Нормализуй написание: Дніпро/Днепр/Днепропетровск → Днепр, Харків → Харьков, Київ → Киев, Кривий Ріг → Кривой Рог, Запоріжжя → Запорожье, Львів → Львов, Одеса → Одесса, Миколаїв → Николаев
+- Если видишь только район или область без города — оставь пустую строку
 
 Если поле не найдено — пустая строка "".
 """
