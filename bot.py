@@ -32,8 +32,6 @@ DATE_FMT      = "%d.%m.%Y %H:%M"
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 pending: dict[int, list] = {}
-pending_timers: dict[int, asyncio.Task] = {}
-BATCH_WAIT = 4
 
 # ── Google Sheets ──────────────────────────────────────────────────────────────
 
@@ -58,27 +56,65 @@ def get_sheet(name="Резюме"):
     return ws
 
 CITY_ALIASES = {
-    "дніпро": "Днепр", "дніпропетровськ": "Днепр", "днепропетровск": "Днепр",
-    "днепр": "Днепр", "d": "Днепр",
+    # Днепр
+    "дніпро": "Днепр", "дніпропетровськ": "Днепр", "днепропетровск": "Днепр", "днепр": "Днепр",
+    # Киев
     "київ": "Киев", "киев": "Киев",
+    # Харьков
     "харків": "Харьков", "харьков": "Харьков",
+    # Кривой Рог
     "кривий ріг": "Кривой Рог", "кривой рог": "Кривой Рог",
+    # Запорожье
     "запоріжжя": "Запорожье", "запорожье": "Запорожье",
+    # Львов
     "львів": "Львов", "львов": "Львов",
+    # Одесса
     "одеса": "Одесса", "одесса": "Одесса",
-    "миколаїв": "Николаев", "николаев": "Николаев",
+    # Николаев
+    "миколаїв": "Николаев", "николаев": "Николаев", "миколів": "Николаев",
+    # Каменское
+    "кам'янське": "Каменское", "камянське": "Каменское", "каменское": "Каменское",
+    "кам'янске": "Каменское", "камянске": "Каменское",
+    # Ивано-Франковск
+    "івано-франківськ": "Ивано-Франковск", "івано франківськ": "Ивано-Франковск",
+    "ивано-франковск": "Ивано-Франковск", "ивано франковск": "Ивано-Франковск",
+    # Другие
     "полтава": "Полтава",
     "вінниця": "Винница", "винница": "Винница",
     "павлоград": "Павлоград",
-    "кам'янське": "Каменское", "каменское": "Каменское",
     "нікополь": "Никополь", "никополь": "Никополь",
+    "черкаси": "Черкассы", "черкассы": "Черкассы",
+    "суми": "Сумы", "сумы": "Сумы",
+    "житомир": "Житомир",
+    "рівне": "Ровно", "ровно": "Ровно",
+    "луцьк": "Луцк", "луцк": "Луцк",
+    "тернопіль": "Тернополь", "тернополь": "Тернополь",
+    "херсон": "Херсон",
+    "хмельницький": "Хмельницкий", "хмельницкий": "Хмельницкий",
+    "чернівці": "Черновцы", "черновцы": "Черновцы",
+    "чернігів": "Чернигов", "чернигов": "Чернигов",
 }
 
 def normalize_city(city: str) -> str:
+    from difflib import get_close_matches
     if not city:
         return ""
     key = city.strip().lower()
-    return CITY_ALIASES.get(key, city.strip().title())
+    # 1. Точное совпадение в словаре
+    if key in CITY_ALIASES:
+        return CITY_ALIASES[key]
+    # 2. Нечёткий поиск по ключам словаря (cutoff=0.82 — достаточно строго)
+    matches = get_close_matches(key, CITY_ALIASES.keys(), n=1, cutoff=0.82)
+    if matches:
+        return CITY_ALIASES[matches[0]]
+    # 3. Нечёткий поиск по значениям (уже нормализованным названиям)
+    normalized_values = list(set(CITY_ALIASES.values()))
+    values_lower = {v.lower(): v for v in normalized_values}
+    matches2 = get_close_matches(key, values_lower.keys(), n=1, cutoff=0.82)
+    if matches2:
+        return values_lower[matches2[0]]
+    # 4. Не нашли — возвращаем как есть с заглавной буквы
+    return city.strip().title()
 
 def get_or_create_city_sheet(sh, city: str):
     """Получает или создаёт лист для города."""
@@ -416,37 +452,32 @@ def get_user_name(update: Update) -> str:
     u = update.effective_user
     return u.full_name or u.username or str(u.id)
 
-async def schedule_batch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if chat_id in pending_timers:
-        pending_timers[chat_id].cancel()
+PROCESS_BTN = "✅ Обработать резюме"
+EXPORT_BTN   = "📤 Экспорт в CRM"
 
-    count = len(pending.get(chat_id, []))
-    if count == 1:
-        msg = await update.message.reply_text("📥 Получено 1 резюме, жду ещё...")
-        ctx.chat_data["status_msg"] = msg
-    else:
-        try:
-            await ctx.chat_data["status_msg"].edit_text(f"📥 Получено {count} резюме, жду ещё...")
-        except Exception:
-            pass
-
-    async def delayed():
-        await asyncio.sleep(BATCH_WAIT)
-        status_msg = ctx.chat_data.get("status_msg")
-        if status_msg:
-            await run_batch(chat_id, status_msg, ctx.bot)
-
-    pending_timers[chat_id] = asyncio.create_task(delayed())
+def main_keyboard(count: int = 0) -> ReplyKeyboardMarkup:
+    """Клавиатура с кнопками. Показывает счётчик если что-то накоплено."""
+    process_label = f"✅ Обработать резюме ({count} шт.)" if count > 0 else "✅ Обработать резюме"
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(process_label)],
+         [KeyboardButton(EXPORT_BTN)]],
+        resize_keyboard=True
+    )
 
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
     photo = update.message.photo[-1]
-    pending.setdefault(update.effective_chat.id, []).append({
+    pending.setdefault(chat_id, []).append({
         "kind": "photo", "file_id": photo.file_id, "who": get_user_name(update),
     })
-    await schedule_batch(update, ctx)
+    count = len(pending[chat_id])
+    await update.message.reply_text(
+        f"📥 Накоплено {count} резюме. Когда загрузишь все — нажми кнопку ✅",
+        reply_markup=main_keyboard(count)
+    )
 
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
     doc = update.message.document
     fname = (doc.file_name or "").lower()
     mime = doc.mime_type or ""
@@ -464,33 +495,57 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Формат {ext} не поддерживается. Жду: jpg, png, pdf, docx.")
         return
 
-    pending.setdefault(update.effective_chat.id, []).append({
+    pending.setdefault(chat_id, []).append({
         "kind": kind, "file_id": doc.file_id, "fname": fname, "who": get_user_name(update),
     })
-    await schedule_batch(update, ctx)
+    count = len(pending[chat_id])
+    await update.message.reply_text(
+        f"📥 Накоплено {count} резюме. Когда загрузишь все — нажми кнопку ✅",
+        reply_markup=main_keyboard(count)
+    )
+
+async def handle_process_btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Кнопка Обработать — запускает батч вручную."""
+    chat_id = update.effective_chat.id
+    count = len(pending.get(chat_id, []))
+    if count == 0:
+        await update.message.reply_text(
+            "📭 Нет накопленных резюме. Сначала загрузи файлы или фото.",
+            reply_markup=main_keyboard(0)
+        )
+        return
+    status_msg = await update.message.reply_text(
+        f"⏳ Запускаю обработку {count} резюме...",
+        reply_markup=main_keyboard(0)
+    )
+    await run_batch(chat_id, status_msg, ctx.bot)
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
+    # Кнопки обрабатываем отдельно
+    if EXPORT_BTN in text:
+        await cmd_export(update, ctx)
+        return
     if len(text) < 30:
         return
-    pending.setdefault(update.effective_chat.id, []).append({
+    chat_id = update.effective_chat.id
+    pending.setdefault(chat_id, []).append({
         "kind": "text", "text": text, "who": get_user_name(update),
     })
-    await schedule_batch(update, ctx)
+    count = len(pending[chat_id])
+    await update.message.reply_text(
+        f"📥 Накоплено {count} резюме. Когда загрузишь все — нажми кнопку ✅",
+        reply_markup=main_keyboard(count)
+    )
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name or ""
-    keyboard = ReplyKeyboardMarkup(
-        [[KeyboardButton("📤 Экспорт в CRM (/export)")]],
-        resize_keyboard=True
-    )
     await update.message.reply_text(
         f"👋 Привет, {name}!\n\n"
-        "Отправь резюме — извлеку данные и запишу в Google Таблицу.\n\n"
-        "📎 Форматы: фото, jpg, png, pdf, docx\n"
-        "📦 Можно кидать пачками\n\n"
-        "📤 /export — выгрузить xlsx для CRM",
-        reply_markup=keyboard,
+        "Загружай резюме — фото, jpg, png, pdf, docx.\n"
+        "Когда загрузишь все — нажми ✅ Обработать.\n\n"
+        "📤 Экспорт в CRM — выгрузить xlsx файл для импорта.",
+        reply_markup=main_keyboard(0)
     )
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -499,7 +554,7 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("export", cmd_export))
-    app.add_handler(MessageHandler(filters.Regex(r"Экспорт в CRM"), cmd_export))
+    app.add_handler(MessageHandler(filters.Regex(r"✅ Обработать"), handle_process_btn))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
@@ -508,3 +563,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
