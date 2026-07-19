@@ -314,49 +314,49 @@ def set_last_export(chat_id: int, dt: datetime):
     except Exception as e:
         log.warning(f"set_last_export error: {e}")
 
-def get_rows_since(since: datetime | None, user_name: str) -> list[list]:
-    """Возвращает строки для конкретного пользователя начиная с даты since."""
+def get_unexported_rows(user_name: str):
+    """Возвращает (rows, row_numbers, exp_col) — все НЕэкспортированные строки пользователя."""
     ws = get_sheet("Резюме")
     all_rows = ws.get_all_values()
     if len(all_rows) <= 1:
-        return []
+        return [], [], None
 
-    # Определяем индексы колонок по заголовку — защита от смены структуры
     headers = [h.strip() for h in all_rows[0]]
     try:
-        who_idx  = headers.index("Кто добавил")
-        date_idx = headers.index("Дата")
+        who_idx = headers.index("Кто добавил")
     except ValueError:
-        # Fallback — старая структура
-        who_idx, date_idx = 6, 7
+        who_idx = 8
 
-    result = []
-    for row in all_rows[1:]:
-        if len(row) <= max(who_idx, date_idx):
+    # Колонка "Экспортировано" — создаём если нет
+    if "Экспортировано" in headers:
+        exp_idx = headers.index("Экспортировано")
+    else:
+        exp_idx = len(headers)
+        ws.update_cell(1, exp_idx + 1, "Экспортировано")
+
+    result_rows = []
+    result_nums = []
+    for i, row in enumerate(all_rows[1:], start=2):
+        if len(row) <= who_idx:
             continue
-        date_str = row[date_idx].strip()
-        who      = row[who_idx].strip()
-        if not date_str:
+        who = row[who_idx].strip()
+        exported = row[exp_idx].strip() if len(row) > exp_idx else ""
+        if who.lower() != user_name.strip().lower():
             continue
-        # Сравниваем имена без учёта регистра и обрезая пробелы
-        if who.strip().lower() != user_name.strip().lower():
+        if exported:
             continue
-        # Пробуем несколько форматов даты (полная строка, без обрезки)
-        row_dt = None
-        for fmt in [DATE_FMT, "%d.%m.%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%d.%m.%Y"]:
-            try:
-                row_dt = datetime.strptime(date_str, fmt)
-                break
-            except Exception:
-                continue
-        if row_dt is None:
-            log.warning(f"Can't parse date: '{date_str}'")
-            continue
-        # Вычитаем 60 сек чтобы не потерять резюме добавленные в ту же минуту
-        threshold = (since - timedelta(seconds=60)) if since else None
-        if threshold is None or row_dt > threshold:
-            result.append(row)
-    return result
+        result_rows.append(row)
+        result_nums.append(i)
+    return result_rows, result_nums, exp_idx + 1  # 1-based col
+
+def mark_exported(row_numbers: list[int], exp_col: int):
+    """Ставит отметку 'да' в колонке Экспортировано для указанных строк."""
+    if not row_numbers:
+        return
+    from gspread.cell import Cell
+    ws = get_sheet("Резюме")
+    cells = [Cell(row=r, col=exp_col, value="да") for r in row_numbers]
+    ws.update_cells(cells)
 
 # ── xlsx генерация ─────────────────────────────────────────────────────────────
 
@@ -603,22 +603,18 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     try:
         user_name = get_user_name(update)
-        last = get_last_export(chat_id)
-        log.info(f"EXPORT: user_name='{user_name}', last={last}, chat_id={chat_id}")
-        rows = get_rows_since(last, user_name)
-        log.info(f"EXPORT: found {len(rows)} rows")
+        log.info(f"EXPORT: user_name='{user_name}', chat_id={chat_id}")
+        rows, row_nums, exp_col = get_unexported_rows(user_name)
+        log.info(f"EXPORT: found {len(rows)} unexported rows")
 
         if not rows:
-            period = f"с {last.strftime(DATE_FMT)}" if last else "за всё время"
-            await safe_edit(msg, f"📭 Нет новых резюме {period}.\n\n🔍 Ищу как: {user_name}")
+            await safe_edit(msg, f"📭 Нет новых резюме для экспорта.\n\n🔍 Ищу как: {user_name}")
             return
 
         buf = generate_crm_xlsx(rows)
         now = datetime.now()
         fname = f"crm_import_{now.strftime('%d%m%Y_%H%M')}.xlsx"
-
-        period_str = f"с {last.strftime(DATE_FMT)}" if last else "за всё время"
-        caption = f"📊 Экспорт для CRM\n{period_str} → {now.strftime(DATE_FMT)}\nКонтактов: {len(rows)}"
+        caption = f"📊 Экспорт для CRM\nКонтактов: {len(rows)}"
 
         await ctx.bot.send_document(
             chat_id=chat_id,
@@ -626,7 +622,8 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             filename=fname,
             caption=caption,
         )
-        set_last_export(chat_id, now)
+        # Помечаем как экспортированные ТОЛЬКО после успешной отправки
+        mark_exported(row_nums, exp_col)
         await msg.delete()
 
     except Exception as e:
