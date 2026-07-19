@@ -336,7 +336,10 @@ def get_rows_since(since: datetime | None, user_name: str) -> list[list]:
             continue
         date_str = row[date_idx].strip()
         who      = row[who_idx].strip()
-        if not date_str or who != user_name:
+        if not date_str:
+            continue
+        # Сравниваем имена без учёта регистра и обрезая пробелы
+        if who.strip().lower() != user_name.strip().lower():
             continue
         # Пробуем несколько форматов даты
         row_dt = None
@@ -598,13 +601,15 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("⏳ Формирую файл для CRM...")
 
     try:
-        user_name = update.effective_user.full_name or update.effective_user.username or str(update.effective_user.id)
+        user_name = get_user_name(update)
         last = get_last_export(chat_id)
+        log.info(f"EXPORT: user_name='{user_name}', last={last}, chat_id={chat_id}")
         rows = get_rows_since(last, user_name)
+        log.info(f"EXPORT: found {len(rows)} rows")
 
         if not rows:
             period = f"с {last.strftime(DATE_FMT)}" if last else "за всё время"
-            await safe_edit(msg, f"📭 Нет новых резюме {period}.")
+            await safe_edit(msg, f"📭 Нет новых резюме {period}.\n\n🔍 Ищу как: {user_name}")
             return
 
         buf = generate_crm_xlsx(rows)
