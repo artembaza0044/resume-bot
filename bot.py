@@ -320,17 +320,33 @@ def get_rows_since(since: datetime | None, user_name: str) -> list[list]:
     all_rows = ws.get_all_values()
     if len(all_rows) <= 1:
         return []
+
+    # Определяем индексы колонок по заголовку — защита от смены структуры
+    headers = [h.strip() for h in all_rows[0]]
+    try:
+        who_idx  = headers.index("Кто добавил")
+        date_idx = headers.index("Дата")
+    except ValueError:
+        # Fallback — старая структура
+        who_idx, date_idx = 6, 7
+
     result = []
     for row in all_rows[1:]:
-        if len(row) < 8:
+        if len(row) <= max(who_idx, date_idx):
             continue
-        date_str = row[7].strip()
-        who      = row[6].strip()
+        date_str = row[date_idx].strip()
+        who      = row[who_idx].strip()
         if not date_str or who != user_name:
             continue
-        try:
-            row_dt = datetime.strptime(date_str, DATE_FMT)
-        except Exception:
+        # Пробуем несколько форматов даты
+        row_dt = None
+        for fmt in [DATE_FMT, "%d.%m.%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%d.%m.%Y"]:
+            try:
+                row_dt = datetime.strptime(date_str[:len(fmt)], fmt)
+                break
+            except Exception:
+                continue
+        if row_dt is None:
             continue
         if since is None or row_dt > since:
             result.append(row)
@@ -726,4 +742,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
