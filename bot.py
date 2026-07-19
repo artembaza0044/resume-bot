@@ -341,15 +341,16 @@ def get_rows_since(since: datetime | None, user_name: str) -> list[list]:
         # Сравниваем имена без учёта регистра и обрезая пробелы
         if who.strip().lower() != user_name.strip().lower():
             continue
-        # Пробуем несколько форматов даты
+        # Пробуем несколько форматов даты (полная строка, без обрезки)
         row_dt = None
         for fmt in [DATE_FMT, "%d.%m.%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%d.%m.%Y"]:
             try:
-                row_dt = datetime.strptime(date_str[:len(fmt)], fmt)
+                row_dt = datetime.strptime(date_str, fmt)
                 break
             except Exception:
                 continue
         if row_dt is None:
+            log.warning(f"Can't parse date: '{date_str}'")
             continue
         # Вычитаем 60 сек чтобы не потерять резюме добавленные в ту же минуту
         threshold = (since - timedelta(seconds=60)) if since else None
