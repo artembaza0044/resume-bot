@@ -5,7 +5,7 @@ import json
 import re
 import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
 
 import anthropic
@@ -348,7 +348,9 @@ def get_rows_since(since: datetime | None, user_name: str) -> list[list]:
                 continue
         if row_dt is None:
             continue
-        if since is None or row_dt > since:
+        # Вычитаем 60 сек чтобы не потерять резюме добавленные в ту же минуту
+        threshold = (since - timedelta(seconds=60)) if since else None
+        if threshold is None or row_dt > threshold:
             result.append(row)
     return result
 
