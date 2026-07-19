@@ -27,7 +27,7 @@ GOOGLE_CREDS_JSON    = os.environ["GOOGLE_CREDS_JSON"]
 GOOGLE_DRIVE_FOLDER  = os.environ.get("GOOGLE_DRIVE_FOLDER", "")
 TELEGRAM_GROUP_ID    = os.environ.get("TELEGRAM_GROUP_ID", "")
 
-HEADERS       = ["ФИО", "Телефон", "Возраст", "Город", "Должности", "Источник", "Кто добавил", "Дата"]
+HEADERS       = ["ФИО", "Телефон", "Возраст", "Город", "Должности", "Источник", "Опыт работы", "Ссылка", "Кто добавил", "Дата"]
 CRM_HEADERS   = ["ФИО", "НОМЕР", "ГОРОД", "ВОЗРАСТ", "ПОЗИЦИЯ", "ИСТОЧНИК"]
 DATE_FMT      = "%d.%m.%Y %H:%M"
 
@@ -90,32 +90,46 @@ def upload_to_drive(file_bytes: bytes, filename: str, city: str, mime_type: str)
 
 # Кэш тем: город -> topic_id
 _topic_cache: dict[str, int] = {}
+_topic_lock = asyncio.Lock()
 
 async def get_or_create_topic(bot, city: str) -> int | None:
-    """Возвращает ID темы для города, создаёт если нет."""
+    """Возвращает ID темы для города, создаёт если нет. Без дублей."""
     if not TELEGRAM_GROUP_ID:
         return None
     group_id = int(TELEGRAM_GROUP_ID)
     city_name = city if city else "Без города"
 
-    if city_name in _topic_cache:
-        return _topic_cache[city_name]
+    # Лок — чтобы параллельные задачи не создавали тему одновременно
+    async with _topic_lock:
+        # Проверяем кэш
+        if city_name in _topic_cache:
+            return _topic_cache[city_name]
 
-    try:
-        # Создаём новую тему
-        topic = await bot.create_forum_topic(
-            chat_id=group_id,
-            name=city_name,
-        )
-        _topic_cache[city_name] = topic.message_thread_id
-        log.info(f"Created topic '{city_name}': {topic.message_thread_id}")
-        return topic.message_thread_id
-    except Exception as e:
-        # Тема возможно уже существует — ищем в кэше или возвращаем None
-        log.warning(f"Topic create error for '{city_name}': {e}")
-        return _topic_cache.get(city_name)
+        # Ищем существующую тему через getForumTopics
+        try:
+            topics = await bot.get_forum_topics(chat_id=group_id)
+            for t in (topics.topics if topics else []):
+                if t.name == city_name:
+                    _topic_cache[city_name] = t.message_thread_id
+                    log.info(f"Found existing topic '{city_name}': {t.message_thread_id}")
+                    return t.message_thread_id
+        except Exception as e:
+            log.warning(f"get_forum_topics error: {e}")
 
-async def send_file_to_group(bot, file_bytes: bytes, filename: str, city: str, 
+        # Не нашли — создаём новую
+        try:
+            topic = await bot.create_forum_topic(
+                chat_id=group_id,
+                name=city_name,
+            )
+            _topic_cache[city_name] = topic.message_thread_id
+            log.info(f"Created topic '{city_name}': {topic.message_thread_id}")
+            return topic.message_thread_id
+        except Exception as e:
+            log.warning(f"Topic create error for '{city_name}': {e}")
+            return None
+
+async def send_file_to_group(bot, file_bytes: bytes, filename: str, city: str,
                               fio: str, phone: str, mime_type: str):
     """Отправляет файл в нужную тему группы."""
     if not TELEGRAM_GROUP_ID:
@@ -125,12 +139,14 @@ async def send_file_to_group(bot, file_bytes: bytes, filename: str, city: str,
         topic_id = await get_or_create_topic(bot, city)
         caption = f"👤 {fio}\n📞 {phone}\n🏙 {city if city else '—'}"
         buf = BytesIO(file_bytes)
-        buf.name = filename
         kwargs = dict(
             chat_id=group_id,
             document=buf,
             filename=filename,
             caption=caption,
+            read_timeout=60,
+            write_timeout=60,
+            connect_timeout=30,
         )
         if topic_id:
             kwargs["message_thread_id"] = topic_id
@@ -138,6 +154,24 @@ async def send_file_to_group(bot, file_bytes: bytes, filename: str, city: str,
         log.info(f"Sent {filename} to group topic '{city}'")
     except Exception as e:
         log.warning(f"Group send error: {e}")
+        # Повторная попытка через 3 секунды
+        try:
+            await asyncio.sleep(3)
+            buf2 = BytesIO(file_bytes)
+            kwargs2 = dict(
+                chat_id=group_id,
+                document=buf2,
+                filename=filename,
+                caption=caption,
+                read_timeout=60,
+                write_timeout=60,
+            )
+            if topic_id:
+                kwargs2["message_thread_id"] = topic_id
+            await bot.send_document(**kwargs2)
+            log.info(f"Retry OK: {filename}")
+        except Exception as e2:
+            log.warning(f"Retry failed: {e2}")
 
 def get_sheet(name="Резюме"):
     gc = get_gc()
@@ -148,7 +182,7 @@ def get_sheet(name="Резюме"):
         ws = sh.add_worksheet(name, rows=5000, cols=20)
         if name == "Резюме":
             ws.append_row(HEADERS)
-            ws.format("A1:H1", {"textFormat": {"bold": True}})
+            ws.format("A1:J1", {"textFormat": {"bold": True}})
         elif name == "Экспорты":
             ws.append_row(["chat_id", "last_export"])
     return ws
@@ -222,7 +256,7 @@ def get_or_create_city_sheet(sh, city: str):
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(sheet_name, rows=5000, cols=len(HEADERS))
         ws.append_row(HEADERS)
-        ws.format(f"A1:H1", {"textFormat": {"bold": True},
+        ws.format(f"A1:J1", {"textFormat": {"bold": True},
                               "backgroundColor": {"red": 0.27, "green": 0.51, "blue": 0.71}})
     return ws
 
@@ -236,7 +270,7 @@ def append_rows_batch(rows: list[list]):
     except gspread.WorksheetNotFound:
         ws_main = sh.add_worksheet("Резюме", rows=5000, cols=len(HEADERS))
         ws_main.append_row(HEADERS)
-        ws_main.format("A1:H1", {"textFormat": {"bold": True}})
+        ws_main.format("A1:J1", {"textFormat": {"bold": True}})
     ws_main.append_rows(rows, value_input_option="USER_ENTERED")
 
     # 2. Листы по городам
@@ -360,9 +394,11 @@ SYSTEM_PROMPT = """Ты извлекаешь данные из резюме с �
   "fio": "Фамилия Имя Отчество на языке оригинала",
   "phone": "380XXXXXXXXX (только цифры, начиная с 380, без пробелов тире скобок плюсов)",
   "age": "только цифра, например 23",
-  "city": "город на русском языке — ТОЛЬКО название города без района и области (Днепр, Киев, Харьков, Кривой Рог, Павлоград и т.д.)",
+  "city": "город на русском языке — ТОЛЬКО название города без района и области",
   "positions": "должность1, должность2 (на языке оригинала)",
-  "source": "Work.ua или Rabota.ua или OLX — определи по логотипу, цветам, стилю сайта. Если не можешь — unknown"
+  "source": "Work.ua или Rabota.ua или OLX — определи по логотипу, цветам, стилю сайта. Если не можешь — unknown",
+  "experience": "краткое описание опыта работы если есть, например: 2 года продавцом в АТБ, 1 год курьером. Если нет опыта — пустая строка",
+  "resume_url": "прямая ссылка на резюме — ищи в адресной строке браузера или внизу страницы. Форматы: work.ua/resumes/XXXXXXX/ или rabota.ua/candidates/XXXXXXX/ или объявление на olx.ua. Если не видно — пустая строка"
 }
 
 Правила для телефона:
@@ -371,11 +407,13 @@ SYSTEM_PROMPT = """Ты извлекаешь данные из резюме с �
 - Уже начинается с 380 — оставь как есть
 - Только цифры, никаких символов
 
-Правила для города:
-- Ищи в любом месте страницы: блок "Місцезнаходження", "Місто", "Город", рядом с картой, в контактах
-- На OLX город часто в блоке "Місцезнаходження" или под именем
-- Нормализуй написание: Дніпро/Днепр/Днепропетровск → Днепр, Харків → Харьков, Київ → Киев, Кривий Ріг → Кривой Рог, Запоріжжя → Запорожье, Львів → Львов, Одеса → Одесса, Миколаїв → Николаев
-- Если видишь только район или область без города — оставь пустую строку
+Правила для города (очень важно — читай внимательно):
+- Ищи везде: адресная строка браузера, блок "Місцезнаходження", "Місто", "Город", под фото профиля, рядом с картой
+- На OLX: город написан в блоке "Місцезнаходження" — читай ТОЛЬКО город, без района (например "Дніпро" а не "Дніпровський район")
+- На Work.ua и Rabota.ua: город в блоке "Місто проживання" или "Город"
+- Нормализуй на русский: Дніпро/Дніпропетровськ/Днепропетровск → Днепр, Харків → Харьков, Київ → Киев, Кривий Ріг → Кривой Рог, Запоріжжя → Запорожье, Львів → Львов, Одеса → Одесса, Миколаїв → Николаев, Кам'янське/Кам'янск → Каменское, Новомосковськ → Новомосковск, Павлоград → Павлоград, Вінниця → Винница, Івано-Франківськ → Ивано-Франковск, Черкаси → Черкассы, Суми → Сумы
+- Если видишь район или область без города — пустая строка
+- Никогда не пиши область (Дніпропетровська область → просто Днепр)
 
 Если поле не найдено — пустая строка "".
 """
@@ -387,7 +425,7 @@ def _parse(raw: str) -> dict:
 def extract_from_image(image_bytes: bytes, mime: str = "image/jpeg") -> dict:
     b64 = base64.standard_b64encode(image_bytes).decode()
     msg = client.messages.create(
-        model="claude-haiku-4-5-20251001", max_tokens=500, system=SYSTEM_PROMPT,
+        model="claude-haiku-4-5-20251001", max_tokens=800, system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}},
             {"type": "text", "text": "Извлеки данные из этого скриншота резюме."}
@@ -398,7 +436,7 @@ def extract_from_image(image_bytes: bytes, mime: str = "image/jpeg") -> dict:
 def extract_from_pdf(pdf_bytes: bytes) -> dict:
     b64 = base64.standard_b64encode(pdf_bytes).decode()
     msg = client.messages.create(
-        model="claude-haiku-4-5-20251001", max_tokens=500, system=SYSTEM_PROMPT,
+        model="claude-haiku-4-5-20251001", max_tokens=800, system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": [
             {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": b64}},
             {"type": "text", "text": "Извлеки данные из этого резюме."}
@@ -408,7 +446,7 @@ def extract_from_pdf(pdf_bytes: bytes) -> dict:
 
 def extract_from_text(text: str) -> dict:
     msg = client.messages.create(
-        model="claude-haiku-4-5-20251001", max_tokens=500, system=SYSTEM_PROMPT,
+        model="claude-haiku-4-5-20251001", max_tokens=800, system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": f"Резюме:\n{text}"}],
     )
     return _parse(msg.content[0].text)
@@ -502,6 +540,8 @@ async def run_batch(chat_id: int, status_msg, bot):
                 data.get("city", ""),
                 data.get("positions", ""),
                 data.get("source", ""),
+                data.get("experience", ""),
+                data.get("resume_url", ""),
                 data.get("who", ""),
                 now,
             ])
@@ -686,3 +726,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
