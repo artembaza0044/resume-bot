@@ -363,43 +363,31 @@ def mark_exported(row_numbers: list[int], exp_col: int):
 TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "crm_template.xlsx")
 
 def generate_crm_xlsx(rows: list[list]) -> BytesIO:
-    """Генерирует xlsx точной копией шаблона CRM."""
+    """Генерирует xlsx по шаблону CRM (Контакты)."""
     wb = load_workbook(TEMPLATE_PATH)
-    ws = wb.active
+    ws = wb.active  # лист "Контакты"
 
-    # Удаляем все строки с данными (оставляем только заголовок)
+    # Удаляем строку-пример и всё остальное кроме заголовка
     if ws.max_row > 1:
         ws.delete_rows(2, ws.max_row - 1)
 
-    # Стили — точно как в шаблоне
-    thin = Side(style="thin")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    arial_bold = Font(name="Arial", bold=True)
-    jetbrains  = Font(name="JetBrains Mono", bold=False)
-    white_fill = PatternFill("solid", fgColor="FFFFFFFF")
+    data_font = Font(name="Calibri", size=11)
 
-    # rows колонки: ФИО(0) Телефон(1) Возраст(2) Город(3) Должности(4) Источник(5) Кто(6) Дата(7)
+    # Мастер-таблица: ФИО(0) Телефон(1) Возраст(2) Город(3) Должности(4) Источник(5) ...
+    # Шаблон CRM:     ФИО | Телефон | Второй телефон | Возраст | Город | Источник | Вакансия | Дата звонка
     for r_i, row in enumerate(rows, 2):
         fio      = row[0] if len(row) > 0 else ""
         phone    = str(row[1]).replace(".0", "") if len(row) > 1 else ""
-        city     = row[3] if len(row) > 3 else ""
         age      = str(row[2]).replace(".0", "") if len(row) > 2 else ""
+        city     = row[3] if len(row) > 3 else ""
         position = row[4] if len(row) > 4 else ""
         source   = row[5] if len(row) > 5 else ""
 
-        vals = [fio, phone, city, age, position, source]
-        ws.row_dimensions[r_i].height = 15.75
-
+        vals = [fio, phone, "", age, city, source, position, ""]
         for c_i, val in enumerate(vals, 1):
             cell = ws.cell(row=r_i, column=c_i, value=val)
-            cell.border = border
-            cell.fill = white_fill
-            cell.alignment = Alignment(horizontal="left", vertical="bottom")
-            if c_i == 6:  # ИСТОЧНИК — JetBrains Mono
-                cell.font = jetbrains
-            else:
-                cell.font = arial_bold
-            if c_i == 2:  # НОМЕР — текст, без .0 и E+11
+            cell.font = data_font
+            if c_i in (2, 3):  # телефоны — текстовый формат
                 cell.number_format = "@"
 
     buf = BytesIO()
