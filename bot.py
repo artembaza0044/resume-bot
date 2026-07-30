@@ -10,6 +10,8 @@ from io import BytesIO
 
 import anthropic
 from docx import Document
+from PIL import Image
+from pypdf import PdfReader
 import gspread
 from google.oauth2.service_account import Credentials
 from openpyxl import load_workbook
@@ -445,18 +447,52 @@ def _parse(raw: str) -> dict:
     raw = re.sub(r"^```json|^```|```$", "", raw, flags=re.MULTILINE).strip()
     return json.loads(raw)
 
+MAX_IMAGE_EDGE = 1568   # рекомендация Anthropic — больше не даёт точности, только цена
+JPEG_QUALITY   = 85
+
+def optimize_image(image_bytes: bytes) -> tuple[bytes, str]:
+    """Уменьшает скриншот до разумного размера. Экономит ~70% стоимости запроса."""
+    try:
+        img = Image.open(BytesIO(image_bytes))
+        w, h = img.size
+        scale = min(MAX_IMAGE_EDGE / max(w, h), 1.0)
+        if scale < 1.0:
+            img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+        log.info(f"Image optimized: {w}x{h} -> {img.size[0]}x{img.size[1]}")
+        return buf.getvalue(), "image/jpeg"
+    except Exception as e:
+        log.warning(f"Image optimize failed, sending original: {e}")
+        return image_bytes, "image/jpeg"
+
 def extract_from_image(image_bytes: bytes, mime: str = "image/jpeg") -> dict:
-    b64 = base64.standard_b64encode(image_bytes).decode()
+    opt_bytes, opt_mime = optimize_image(image_bytes)
+    b64 = base64.standard_b64encode(opt_bytes).decode()
     msg = client.messages.create(
         model="claude-haiku-4-5-20251001", max_tokens=800, system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": [
-            {"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}},
+            {"type": "image", "source": {"type": "base64", "media_type": opt_mime, "data": b64}},
             {"type": "text", "text": "Извлеки данные из этого скриншота резюме."}
         ]}],
     )
     return _parse(msg.content[0].text)
 
 def extract_from_pdf(pdf_bytes: bytes) -> dict:
+    """Сначала пробуем вытащить текст локально — это в разы дешевле.
+    Если PDF сканированный (текста нет) — отправляем как документ."""
+    try:
+        reader = PdfReader(BytesIO(pdf_bytes))
+        text = "\n".join((page.extract_text() or "") for page in reader.pages)
+        if len(text.strip()) >= 100:
+            log.info(f"PDF text extracted locally ({len(text)} chars) — cheap path")
+            return extract_from_text(text)
+        log.info("PDF has no text layer — falling back to document API")
+    except Exception as e:
+        log.warning(f"PDF local extract failed: {e} — falling back to document API")
+
     b64 = base64.standard_b64encode(pdf_bytes).decode()
     msg = client.messages.create(
         model="claude-haiku-4-5-20251001", max_tokens=800, system=SYSTEM_PROMPT,
@@ -468,6 +504,7 @@ def extract_from_pdf(pdf_bytes: bytes) -> dict:
     return _parse(msg.content[0].text)
 
 def extract_from_text(text: str) -> dict:
+    text = text[:12000]  # отсекаем хвост — в резюме всё важное вверху
     msg = client.messages.create(
         model="claude-haiku-4-5-20251001", max_tokens=800, system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": f"Резюме:\n{text}"}],
